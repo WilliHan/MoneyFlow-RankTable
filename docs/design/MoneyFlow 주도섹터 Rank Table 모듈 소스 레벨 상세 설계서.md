@@ -1,6 +1,6 @@
 # MoneyFlow 주도섹터 Rank Table 모듈 소스 레벨 상세 설계서
 
-문서 버전: v5.0
+문서 버전: v5.1
 작성일: 2026-06-20
 프로젝트명: MoneyFlow Rank Table (MFRT)
 목적: 월별 업종 수익률 순위 테이블을 기반으로 주도 섹터 탄생 → 확산 → 과열 → 피크아웃 → 주도권 교체를 탐지하고, MoneyFlow / 3중스크린 / 추세추종 스윙 투자 시스템에 연결하기 위한 소스 레벨 상세 설계
@@ -17,6 +17,7 @@
 | v3.1 | 2026-06-20 | Path3(_try_krx_direct) 섹션 제목·docstring·상수 주석을 "미확정 설계 계약" 상태로 명확화, settings.py YAML 로더(load_config/build_leadership_score_config/build_signal_config/get_min_months_required) 설계 추가, CLI에서 YAML → Config 실제 연결(--config 인수, build_*_config 호출, min_months YAML에서 로드) |
 | v3.2 | 2026-06-20 | _fetch_month_end 실패 반환 계약 3튜플로 통일((None,None) → (None,None,"")), SignalConfig에서 미사용 중복 필드(leader_lookback_months/extended_lookback_months) 제거 — 윈도우 소스를 LeadershipScoreConfig 단일 소유로 명확화, YAML signals 섹션 주석 정합성 수정 |
 | v3.3 | 2026-06-20 | LeadershipScoreConfig rolling window 주석에서 구버전 표현("SignalConfig와 반드시 일치") 제거 — 단일 소유 의도와 일치하도록 수정 |
+| v5.1 | 2026-06-20 | §21 계약 정합성 수정 4건. [높음] sector_rank_snapshot 스키마에 rank_change/prev_rank_no 추가 — build_snapshot() 출력·save_sector_rank_snapshot() SQL·CRUD load_* 4개 함수(load_sector_rank_snapshot/load_sector_monthly_return/load_sector_leadership_score/load_sector_rotation_signal) 정의. [높음] CLI run_report.py 계약 수정: get_connection(cfg)→get_connection(args.db_path), 인수 명세(--db-path/--months-back/--output-dir), load_*/get_top_n import 추가, exporter에 top_n 주입. [중간] 점수 예시값·최대값 표를 LeadershipScoreConfig 실제 계단형 값으로 수정(persistence 최대 30, expansion/volume 각 20, 모두 이산값). [중간] range(1,22)/순위 1~21 하드코딩 제거 → range(1,top_n+1)/top_n 파라미터화 |
 | v5.0 | 2026-06-20 | §21 화면 설계 신규 추가: 투자자 활용 UI 전체 설계. 신호별 색상 체계(7종), Excel 4-Sheet 구성(로테이션 매트릭스·신호 요약·수익률 히트맵·점수 상세), 정적 HTML 3-패널 대시보드(신호 패널·매트릭스·선택 섹터 상세+체크리스트), MultiSheetExcelExporter·HtmlDashboardExporter 코드 설계, CLI report 서브커맨드, 투자자 화면 읽는 법 |
 | v4.1 | 2026-06-20 | [높음] CRUD 함수 conn.commit() 전면 제거 — 트랜잭션 소유권을 CLI 단독으로 명확화, crud.py 상단에 트랜잭션 설계 계약 주석 추가. [중간] warmup off-by-one 수정: obs_count < N → obs_count <= N (warmup=3이면 1~3번째 월 억제, 4번째부터 허용). [중간] --trade-month 검증 강화: 정규식을 \d{4}-(0[1-9]\|1[0-2])로 교체해 13월·00월 차단. [낮음] WATCH 정책 표: "Top20" → "Top{top_n} 이내 (기본 21위)" |
 | v4.0 | 2026-06-20 | 전문가 리뷰 #1~#16 전체 반영: rotation_signal PK 단순화, return_zscore 컬럼 제거, _extract_last_row fallback 제거, rolling_min_periods config화, _calc_consecutive_top10 transform 방식 교체, CLI 단일 트랜잭션, --trade-month 형식 검증, test_rotation_out 다월 재작성, mask_adjacent PeriodIndex 벡터화, NEW_LEADER warmup 억제 옵션, expansion_score NULL 방어, snapshot PK 변경, top_n YAML 연결, LEADERSHIP_SCORE_COLUMNS 컬럼 select, 연도 경계 테스트 추가, _make_reason NaN 가드 |
@@ -250,14 +251,17 @@ ON sector_monthly_return(trade_month, rank_no);
 
 ```sql
 CREATE TABLE IF NOT EXISTS sector_rank_snapshot (
-    trade_month   TEXT NOT NULL,
-    sector_code   TEXT NOT NULL,
-    sector_name   TEXT NOT NULL,
-    rank_no       INTEGER NOT NULL,
+    trade_month    TEXT NOT NULL,
+    sector_code    TEXT NOT NULL,
+    sector_name    TEXT NOT NULL,
+    rank_no        INTEGER NOT NULL,
+    prev_rank_no   INTEGER,            -- NULL = 첫 월 (비교 불가)
+    rank_change    INTEGER,            -- prev_rank_no - rank_no. NULL = 첫 월
     monthly_return REAL NOT NULL,
-    theme_group   TEXT,
-    display_color TEXT,            -- sector_master에서 복사 (조회 편의)
+    theme_group    TEXT,
+    display_color  TEXT,               -- sector_master에서 복사 (조회 편의)
     -- PK = (trade_month, sector_code): 재실행 시 rank_no 기반 PK는 sector_code 매핑을 오염시킬 수 있다.
+    -- rank_change/prev_rank_no를 snapshot에 포함: 리포트 생성 시 returns_df 없이 화살표 표기 가능.
     PRIMARY KEY (trade_month, sector_code)
 );
 
@@ -628,14 +632,18 @@ def save_sector_rank_snapshot(conn: sqlite3.Connection, df: pd.DataFrame) -> Non
     conn.executemany(
         """
         INSERT INTO sector_rank_snapshot
-            (trade_month, sector_code, sector_name, rank_no, monthly_return, theme_group, display_color)
-        VALUES (:trade_month, :sector_code, :sector_name, :rank_no, :monthly_return, :theme_group, :display_color)
+            (trade_month, sector_code, sector_name, rank_no, prev_rank_no, rank_change,
+             monthly_return, theme_group, display_color)
+        VALUES (:trade_month, :sector_code, :sector_name, :rank_no, :prev_rank_no, :rank_change,
+                :monthly_return, :theme_group, :display_color)
         ON CONFLICT(trade_month, sector_code) DO UPDATE SET
-            sector_name   = excluded.sector_name,
-            rank_no       = excluded.rank_no,
+            sector_name    = excluded.sector_name,
+            rank_no        = excluded.rank_no,
+            prev_rank_no   = excluded.prev_rank_no,
+            rank_change    = excluded.rank_change,
             monthly_return = excluded.monthly_return,
-            theme_group   = excluded.theme_group,
-            display_color = excluded.display_color
+            theme_group    = excluded.theme_group,
+            display_color  = excluded.display_color
         """,
         rows,
     )
@@ -698,6 +706,56 @@ def save_sector_rotation_signal(conn: sqlite3.Connection, df: pd.DataFrame) -> N
         rows,
     )
 ```
+
+def load_sector_rank_snapshot(
+    conn: sqlite3.Connection,
+    up_to_month: str,
+) -> pd.DataFrame:
+    """
+    trade_month <= up_to_month 인 전체 스냅샷 반환 (로테이션 매트릭스용 멀티-월 로드).
+    리포트 생성 시 months_back 필터링은 호출자(Exporter)가 수행한다.
+    """
+    return pd.read_sql(
+        "SELECT * FROM sector_rank_snapshot WHERE trade_month <= ? "
+        "ORDER BY trade_month, rank_no",
+        conn,
+        params=(up_to_month,),
+    )
+
+
+def load_sector_monthly_return(conn: sqlite3.Connection) -> pd.DataFrame:
+    """전체 기간 수익률 반환. 히트맵(12개월) 필터링은 호출자가 수행."""
+    return pd.read_sql(
+        "SELECT * FROM sector_monthly_return ORDER BY sector_code, trade_month",
+        conn,
+    )
+
+
+def load_sector_leadership_score(
+    conn: sqlite3.Connection,
+    trade_month: str,
+) -> pd.DataFrame:
+    """지정 월의 점수 데이터 반환."""
+    return pd.read_sql(
+        "SELECT * FROM sector_leadership_score WHERE trade_month = ?",
+        conn,
+        params=(trade_month,),
+    )
+
+
+def load_sector_rotation_signal(
+    conn: sqlite3.Connection,
+    trade_month: str,
+) -> pd.DataFrame:
+    """지정 월의 신호 데이터 반환."""
+    return pd.read_sql(
+        "SELECT * FROM sector_rotation_signal WHERE trade_month = ?",
+        conn,
+        params=(trade_month,),
+    )
+```
+
+---
 
 ### 7.2 월간 수익률 계산 (MonthlyReturnCalculator)
 
@@ -857,8 +915,12 @@ class RankTableBuilder:
         )
         return df[[
             "trade_month", "rank_no", "sector_code", "sector_name",
+            "prev_rank_no", "rank_change",
             "monthly_return", "theme_group", "display_color",
         ]].sort_values(["trade_month", "rank_no"]).reset_index(drop=True)
+        # prev_rank_no, rank_change: returns_df에서 이미 계산된 값을 snapshot에 복사.
+        # 리포트 생성(MultiSheetExcelExporter·HtmlDashboardExporter) 시
+        # returns_df 없이 snapshot_df 단독으로 화살표(▲N/▼N) 표기가 가능하다.
 
     def build_color_lookup(self, snapshot_df: pd.DataFrame) -> dict[str, str]:
         """sector_name → display_color 조회 테이블 반환."""
@@ -2364,7 +2426,7 @@ Excel·HTML 전체에서 동일한 색상 체계를 사용한다. `SIGNAL_COLORS
 **목적**: 섹터가 몇 달에 걸쳐 어떻게 이동하는지 한눈에 파악한다.
 
 레이아웃 규칙:
-- **행**: 순위 1~21 고정
+- **행**: 순위 1~`top_n` (YAML `sector_universe.top_n`, 기본 21)
 - **열**: 최근 `months_back`개월(기본 6) + 현재월 + 신호 컬럼
 - **히스토리 열 셀 색상**: `display_color` (테마 그룹 색)
 - **현재월 열 셀 색상**: 신호 색상 (`SIGNAL_COLORS`)
@@ -2426,7 +2488,7 @@ Excel·HTML 전체에서 동일한 색상 체계를 사용한다. `SIGNAL_COLORS
 ├──────────┴──────┴──────┴──────────────┴──────┴────────┴──────────────────────────┤
 │ ■ NEW_LEADER: 신규 주도 후보   ■ LEADER: 주도섹터   ■ EXTENDED: 장기주도·추격주의  │
 │ ■ PEAK_WARNING: 피크아웃 경고  ■ ROTATION_OUT: 주도권 이탈   ■ WATCH: 모니터링     │
-│ 점수 구성: 순위(30) + 모멘텀(20) + 지속성(20) + 확산(15) + 거래대금(15) - 리스크   │
+│ 점수: 순위(0/10/20/30)+모멘텀(0/20)+지속성(0/20/30)+확산(0/20)+거래대금(0/20)-패널티(0/-10) │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -2473,26 +2535,34 @@ Excel·HTML 전체에서 동일한 색상 체계를 사용한다. `SIGNAL_COLORS
 │ 업종명    │ 합계 │ 순위 │모멘텀│지속성│확산성│거래대│리스크│3M   │6M   │ 연속 │ 코멘트               │
 │           │ 점수 │ 점수 │ 점수 │ 점수 │ 점수 │금    │패널티│Top10│Top10│Top10 │                      │
 ├──────────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────────────────────┤
-│ 건설업    │  87  │  30  │  20  │  18  │  12  │  12  │  -5  │   3  │   5  │   2  │ 순위급상승+거래대금↑  │
-│ 의약품    │  78  │  28  │  14  │  20  │  10  │   8  │   0  │   3  │   6  │   4  │ 지속성 강함           │
-│ 전기전자  │  65  │  26  │   5  │  20  │  10  │   8  │  -4  │   3  │   6  │   6  │ EXTENDED 피크 경계    │
+│ 건설업    │  90  │  30  │  20  │  20  │   0  │  20  │   0  │   2  │   3  │   2  │ 순위급상승+거래대금↑  │
+│ 의약품    │  90  │  30  │   0  │  30  │  20  │  20  │ -10  │   3  │   6  │   5  │ 지속성 강함·과열경계  │
+│ 전기전자  │  70  │  20  │   0  │  30  │  20  │   0  │   0  │   3  │   6  │   6  │ 지속성 강함, 거래대금 │
 │   ...    │  ... │  ... │  ... │  ... │  ... │  ... │  ... │  ... │  ... │  ... │   ...                │
 └──────────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────────────────────┘
 ```
 
-| 열 | 소스 필드 | 최대값 |
+점수 구성요소는 모두 계단형(step function) 이산값이다:
+- `rank_score`: {0, 10, 20, 30} (rank_no > 20 → 0, ≤ 20 → 10, ≤ 10 → 20, ≤ 3 → 30)
+- `momentum_score`: {0, 20} (rank_change ≥ rank_jump_threshold → 20, 미만 → 0)
+- `persistence_score`: {0, 20, 30} (top10_in_3m ≥ 3 → 30, ≥ 2 → 20, 미만 → 0)
+- `expansion_score`: {0, 20} (동일 테마 그룹 Top20 섹터 ≥ 2개 → 20, 미만 → 0)
+- `volume_score`: {0, 20} (trading_value > prev × 1.3 → 20, 이하 → 0)
+- `risk_penalty`: {0, −10} (consecutive_top10 ≥ overheat_top10_months → −10)
+
+| 열 | 소스 필드 | 가능한 값 |
 |---|---|---|
-| 합계 점수 | `total_score` | — |
-| 순위 점수 | `rank_score` | 30 |
-| 모멘텀 점수 | `momentum_score` | 20 |
-| 지속성 점수 | `persistence_score` | 20 |
-| 확산성 점수 | `expansion_score` | 15 |
-| 거래대금 | `volume_score` | 15 |
-| 리스크 패널티 | `risk_penalty` | (음수) |
-| 3M Top10 | `top10_in_3m` | 3 |
-| 6M Top10 | `top10_in_6m` | 6 |
-| 연속 Top10 | `consecutive_top10` | — |
-| 코멘트 | `score_reason` | — |
+| 합계 점수 | `total_score` | 0 ~ 120 (이론 최대: 30+20+30+20+20) |
+| 순위 점수 | `rank_score` | 0 / 10 / 20 / 30 |
+| 모멘텀 점수 | `momentum_score` | 0 / 20 |
+| 지속성 점수 | `persistence_score` | 0 / 20 / 30 |
+| 확산성 점수 | `expansion_score` | 0 / 20 |
+| 거래대금 | `volume_score` | 0 / 20 |
+| 리스크 패널티 | `risk_penalty` | 0 / −10 |
+| 3M Top10 | `top10_in_3m` | 0 ~ `leader_lookback_months` (기본 3) |
+| 6M Top10 | `top10_in_6m` | 0 ~ `extended_lookback_months` (기본 6) |
+| 연속 Top10 | `consecutive_top10` | 0 ~ (경과 월 수) |
+| 코멘트 | `score_reason` | `_make_reason()` 결과 |
 
 각 행 배경색: §21.2 신호 색상 적용 (Sheet 2와 동일).
 
@@ -2516,7 +2586,7 @@ Excel·HTML 전체에서 동일한 색상 체계를 사용한다. `SIGNAL_COLORS
 │ ┌─────────────┐  │  1  │전기 │전기 │의약 │의약 │건설★│NEW  │  신호: NEW_LEADER            │
 │ │ 의약품  2위  │  │  2  │의약 │의약 │전기 │건설 │의약  │LDR  │  현재 1위 (전월 5위 ▲4)     │
 │ └─────────────┘  │  3  │건설 │화학 │건설 │전기 │전기  │EXT  │                             │
-│                  │ ... │     │     │     │     │      │     │  점수: 87점                  │
+│                  │ ... │     │     │     │     │      │     │  점수: 90점                  │
 │ ★ NEW_LEADER     │ 18  │운수 │운수 │운수 │운수 │운수  │ROT  │  [점수 바 차트]              │
 │ ┌─────────────┐  │ 21  │보험 │보험 │보험 │보험 │보험  │     │                             │
 │ │ 건설업  1위  │  │                                     │  순위 추이 (최근 6M)           │
@@ -2579,13 +2649,13 @@ Excel·HTML 전체에서 동일한 색상 체계를 사용한다. `SIGNAL_COLORS
 │  현재 1위  (전월 5위  ▲4계단 상승)               │
 │  이번달 수익률: +12.4%   전월: +2.1%             │
 ├──────────────────────────────────────────────────┤
-│  점수 합계: 87점                                  │
-│  순위    ████████████████████████████████░░  30/30│
-│  모멘텀  ████████████████████████████████████ 20/20│
-│  지속성  ██████████████████████████████████░░ 18/20│
-│  확산성  ████████████████████████░░░░░░░░░░  12/15│
-│  거래대금 ████████████████████████░░░░░░░░░  12/15│
-│  리스크 패널티: -5점                              │
+│  점수 합계: 90점  (순위30+모멘텀20+지속성20+거래대금20)│
+│  순위    ████████████████████████████████  30/30  │
+│  모멘텀  ████████████████████████████████  20/20  │
+│  지속성  █████████████████████░░░░░░░░░░░  20/30  │
+│  확산성  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0/20  │
+│  거래대금 ████████████████████████████████  20/20  │
+│  리스크 패널티: 0                                 │
 │  [코멘트: 순위급상승+거래대금↑]                   │
 ├──────────────────────────────────────────────────┤
 │  순위 추이 (최근 6개월)                           │
@@ -2678,12 +2748,13 @@ class MultiSheetExcelExporter:
         signal_df: pd.DataFrame,        # sector_rotation_signal
         color_lookup: dict[str, str],   # {sector_name: hex6}
         months_back: int = 6,
+        top_n: int = 21,                # YAML sector_universe.top_n 에서 주입
     ) -> None:
         wb = Workbook()
         trade_month = signal_df["trade_month"].max()
 
         wb.active.title = "섹터 로테이션 매트릭스"
-        self._sheet_rotation_matrix(wb.active, snapshot_df, signal_df, color_lookup, months_back)
+        self._sheet_rotation_matrix(wb.active, snapshot_df, signal_df, color_lookup, months_back, top_n)
         self._sheet_signal_summary(wb.create_sheet("신호 요약"), signal_df, scored_df, returns_df)
         self._sheet_return_heatmap(wb.create_sheet("수익률 히트맵"), returns_df, months_back=12)
         self._sheet_score_detail(wb.create_sheet("점수 상세"), scored_df, signal_df, trade_month)
@@ -2691,7 +2762,7 @@ class MultiSheetExcelExporter:
         wb.save(output_path)
 
     # ── Sheet 1 ─────────────────────────────────────────────────────────────
-    def _sheet_rotation_matrix(self, ws, snapshot_df, signal_df, color_lookup, months_back):
+    def _sheet_rotation_matrix(self, ws, snapshot_df, signal_df, color_lookup, months_back, top_n=21):
         months = sorted(snapshot_df["trade_month"].unique())
         current = months[-1]
         display = months[-(months_back + 1):]
@@ -2727,7 +2798,7 @@ class MultiSheetExcelExporter:
         ws.cell(row=1, column=sig_col, value="신호").fill = RED_FILL
         ws.cell(row=1, column=sig_col).font = Font(color="FFFFFF", bold=True)
 
-        for rank in range(1, 22):
+        for rank in range(1, top_n + 1):
             row = rank + 1
             ws.cell(row=row, column=1, value=rank).fill = RANK_FILL
             for ci, month in enumerate(display, start=2):
@@ -2806,7 +2877,7 @@ class MultiSheetExcelExporter:
         LEGEND = [
             "■ NEW_LEADER: 신규 주도 후보   ■ LEADER: 주도섹터   ■ EXTENDED: 장기주도·추격주의",
             "■ PEAK_WARNING: 피크아웃 경고   ■ ROTATION_OUT: 주도권 이탈   ■ WATCH: 모니터링",
-            "점수 구성: 순위(30) + 모멘텀(20) + 지속성(20) + 확산(15) + 거래대금(15) - 리스크",
+            "점수 구성: 순위(0/10/20/30) + 모멘텀(0/20) + 지속성(0/20/30) + 확산(0/20) + 거래대금(0/20) - 과열패널티(0/-10)",
         ]
         legend_row = len(df) + 2
         LGND_FILL = PatternFill("solid", fgColor="F2F2F2")
@@ -2963,18 +3034,19 @@ class HtmlDashboardExporter:
         signal_df: pd.DataFrame,
         color_lookup: dict[str, str],
         months_back: int = 6,
+        top_n: int = 21,               # YAML sector_universe.top_n 에서 주입
     ) -> None:
         trade_month = signal_df["trade_month"].max()
         payload = self._build_payload(
             trade_month, snapshot_df, returns_df,
-            scored_df, signal_df, color_lookup, months_back
+            scored_df, signal_df, color_lookup, months_back, top_n
         )
         html = self._render(trade_month, payload)
         Path(output_path).write_text(html, encoding="utf-8")
 
     def _build_payload(
         self, trade_month, snapshot_df, returns_df,
-        scored_df, signal_df, color_lookup, months_back
+        scored_df, signal_df, color_lookup, months_back, top_n=21
     ) -> dict:
         months = sorted(snapshot_df["trade_month"].unique())
         display = months[-(months_back + 1):]
@@ -3018,7 +3090,7 @@ class HtmlDashboardExporter:
         matrix = [
             {"rank": r, **{m: pivot.loc[r, m] if r in pivot.index and m in pivot.columns else ""
                            for m in display}}
-            for r in range(1, 22)
+            for r in range(1, top_n + 1)
         ]
         return {
             "trade_month": trade_month,
@@ -3096,7 +3168,7 @@ const SL={{NEW_LEADER:'신규 주도 후보',LEADER:'주도섹터 확정',EXTEND
            PEAK_WARNING:'피크아웃 경고',ROTATION_OUT:'주도권 이탈',WATCH:'모니터링 대상'}};
 const SM={{rank_score:'순위',momentum_score:'모멘텀',persistence_score:'지속성',
            expansion_score:'확산성',volume_score:'거래대금'}};
-const SMAX={{rank_score:30,momentum_score:20,persistence_score:20,expansion_score:15,volume_score:15}};
+const SMAX={{rank_score:30,momentum_score:20,persistence_score:30,expansion_score:20,volume_score:20}};
 const SO=['PEAK_WARNING','ROTATION_OUT','EXTENDED','LEADER','NEW_LEADER','WATCH'];
 const sbg=s=>D.signal_colors[s]?'#'+D.signal_colors[s]:'#FFF';
 const sfg=s=>D.signal_fg[s]?'#'+D.signal_fg[s]:'#000';
@@ -3224,36 +3296,70 @@ buildSP();buildMP();
 #### 21.5.5 CLI `report` 서브커맨드
 
 ```python
-# app/cli/main.py — report 서브커맨드
+# app/cli/run_report.py
+#
+# 사용법:
+#   python -m app.cli.run_report \
+#       --trade-month 2026-01 \
+#       [--months-back 6] \
+#       [--db-path moneyflow.db] \
+#       [--config app/config/sector_config.yaml] \
+#       [--output-dir reports/]
 
-def cmd_report(args):
-    """
-    DB에서 데이터를 읽어 Excel + HTML 리포트를 생성한다.
+from __future__ import annotations
 
-    사용법:
-        python -m app.cli.main report \\
-            --trade-month 2026-01 \\
-            [--months-back 6] \\
-            [--config config/settings.yaml] \\
-            [--output-dir reports/]
-    """
-    cfg  = load_config(args.config)
-    conn = get_connection(cfg)
+import argparse
+from pathlib import Path
+
+from app.db.connection import get_connection
+from app.db.crud import (
+    load_sector_master,
+    load_sector_rank_snapshot,
+    load_sector_monthly_return,
+    load_sector_leadership_score,
+    load_sector_rotation_signal,
+)
+from app.services.rank_table_builder import RankTableBuilder
+from app.reports.multi_sheet_excel_exporter import MultiSheetExcelExporter
+from app.reports.html_dashboard_exporter import HtmlDashboardExporter
+from app.config.settings import load_config, get_top_n
+
+
+def _valid_trade_month(value: str) -> str:
+    import re
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        raise argparse.ArgumentTypeError(
+            f"trade-month must be YYYY-MM with month 01~12, got: {value!r}"
+        )
+    return value
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MFRT 리포트 생성")
+    parser.add_argument("--trade-month", required=True, type=_valid_trade_month)
+    parser.add_argument("--months-back", type=int, default=6)
+    parser.add_argument("--db-path", default=None)          # None → MFRT_DB_PATH env var → moneyflow.db
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--output-dir", default="reports")
+    args = parser.parse_args()
+
+    cfg         = load_config(args.config)
+    top_n       = get_top_n(cfg)                             # YAML sector_universe.top_n
+    conn        = get_connection(args.db_path)               # db_path: str | None — 기존 계약 준수
     trade_month = args.trade_month
-    months_back = getattr(args, "months_back", 6)
+    months_back = args.months_back
 
-    snapshot_df    = load_sector_rank_snapshot(conn, trade_month)
-    returns_df     = load_sector_monthly_return(conn)
-    scored_df      = load_sector_leadership_score(conn, trade_month)
-    signal_df      = load_sector_rotation_signal(conn, trade_month)
-    sector_master  = load_sector_master(conn)
+    # load_* 함수: §7.1 CRUD 인터페이스에 정의된 함수만 사용
+    snapshot_df   = load_sector_rank_snapshot(conn, trade_month)
+    returns_df    = load_sector_monthly_return(conn)
+    scored_df     = load_sector_leadership_score(conn, trade_month)
+    signal_df     = load_sector_rotation_signal(conn, trade_month)
+    sector_master = load_sector_master(conn)
 
-    pivot_with_color = snapshot_df.merge(
-        sector_master[["sector_name", "display_color"]], on="sector_name", how="left"
-    )
-    color_lookup = RankTableBuilder().build_color_lookup(pivot_with_color)
+    # color_lookup: snapshot에 이미 display_color가 있으므로 sector_master 병합 불필요
+    color_lookup = RankTableBuilder().build_color_lookup(snapshot_df)
 
-    out = Path(getattr(args, "output_dir", "reports"))
+    out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     excel_path = out / f"MFRT_{trade_month}.xlsx"
@@ -3261,14 +3367,20 @@ def cmd_report(args):
 
     MultiSheetExcelExporter().export(
         str(excel_path), snapshot_df, returns_df,
-        scored_df, signal_df, color_lookup, months_back=months_back,
+        scored_df, signal_df, color_lookup,
+        months_back=months_back, top_n=top_n,
     )
     HtmlDashboardExporter().export(
         str(html_path), snapshot_df, returns_df,
-        scored_df, signal_df, color_lookup, months_back=months_back,
+        scored_df, signal_df, color_lookup,
+        months_back=months_back, top_n=top_n,
     )
     print(f"Excel: {excel_path}")
     print(f"HTML : {html_path}")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
