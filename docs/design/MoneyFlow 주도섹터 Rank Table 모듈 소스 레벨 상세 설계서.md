@@ -1,6 +1,6 @@
 # MoneyFlow 주도섹터 Rank Table 모듈 소스 레벨 상세 설계서
 
-문서 버전: v4.0
+문서 버전: v4.1
 작성일: 2026-06-20
 프로젝트명: MoneyFlow Rank Table (MFRT)
 목적: 월별 업종 수익률 순위 테이블을 기반으로 주도 섹터 탄생 → 확산 → 과열 → 피크아웃 → 주도권 교체를 탐지하고, MoneyFlow / 3중스크린 / 추세추종 스윙 투자 시스템에 연결하기 위한 소스 레벨 상세 설계
@@ -17,6 +17,7 @@
 | v3.1 | 2026-06-20 | Path3(_try_krx_direct) 섹션 제목·docstring·상수 주석을 "미확정 설계 계약" 상태로 명확화, settings.py YAML 로더(load_config/build_leadership_score_config/build_signal_config/get_min_months_required) 설계 추가, CLI에서 YAML → Config 실제 연결(--config 인수, build_*_config 호출, min_months YAML에서 로드) |
 | v3.2 | 2026-06-20 | _fetch_month_end 실패 반환 계약 3튜플로 통일((None,None) → (None,None,"")), SignalConfig에서 미사용 중복 필드(leader_lookback_months/extended_lookback_months) 제거 — 윈도우 소스를 LeadershipScoreConfig 단일 소유로 명확화, YAML signals 섹션 주석 정합성 수정 |
 | v3.3 | 2026-06-20 | LeadershipScoreConfig rolling window 주석에서 구버전 표현("SignalConfig와 반드시 일치") 제거 — 단일 소유 의도와 일치하도록 수정 |
+| v4.1 | 2026-06-20 | [높음] CRUD 함수 conn.commit() 전면 제거 — 트랜잭션 소유권을 CLI 단독으로 명확화, crud.py 상단에 트랜잭션 설계 계약 주석 추가. [중간] warmup off-by-one 수정: obs_count < N → obs_count <= N (warmup=3이면 1~3번째 월 억제, 4번째부터 허용). [중간] --trade-month 검증 강화: 정규식을 \d{4}-(0[1-9]\|1[0-2])로 교체해 13월·00월 차단. [낮음] WATCH 정책 표: "Top20" → "Top{top_n} 이내 (기본 21위)" |
 | v4.0 | 2026-06-20 | 전문가 리뷰 #1~#16 전체 반영: rotation_signal PK 단순화, return_zscore 컬럼 제거, _extract_last_row fallback 제거, rolling_min_periods config화, _calc_consecutive_top10 transform 방식 교체, CLI 단일 트랜잭션, --trade-month 형식 검증, test_rotation_out 다월 재작성, mask_adjacent PeriodIndex 벡터화, NEW_LEADER warmup 억제 옵션, expansion_score NULL 방어, snapshot PK 변경, top_n YAML 연결, LEADERSHIP_SCORE_COLUMNS 컬럼 select, 연도 경계 테스트 추가, _make_reason NaN 가드 |
 
 ---
@@ -547,6 +548,13 @@ def get_connection(db_path: str | None = None) -> sqlite3.Connection:
 
 ```python
 # app/db/crud.py
+#
+# 트랜잭션 설계 계약
+# ─────────────────────────────────────────────────────────────
+# 모든 save_*/upsert_* 함수는 commit/rollback을 수행하지 않는다.
+# BEGIN / commit / rollback 은 호출자(CLI main)가 단독으로 관리한다.
+# 이 규칙을 지켜야 CLI의 단일 트랜잭션 설계가 성립한다.
+# ─────────────────────────────────────────────────────────────
 
 import sqlite3
 import pandas as pd
@@ -562,7 +570,9 @@ def load_sector_master(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def upsert_sector_monthly_price(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
-    """df columns: trade_month, sector_code, sector_name, close_price, trading_value, market_cap, source"""
+    """df columns: trade_month, sector_code, sector_name, close_price, trading_value, market_cap, source
+    트랜잭션 관리는 호출자 책임 — 이 함수는 commit/rollback을 수행하지 않는다.
+    """
     rows = df.to_dict(orient="records")
     conn.executemany(
         """
@@ -577,7 +587,6 @@ def upsert_sector_monthly_price(conn: sqlite3.Connection, df: pd.DataFrame) -> N
         """,
         rows,
     )
-    conn.commit()
 
 
 def load_all_monthly_prices(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -589,7 +598,9 @@ def load_all_monthly_prices(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def save_sector_monthly_return(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
-    """df columns: sector_monthly_return 테이블 컬럼과 동일"""
+    """df columns: sector_monthly_return 테이블 컬럼과 동일.
+    트랜잭션 관리는 호출자 책임 — 이 함수는 commit/rollback을 수행하지 않는다.
+    """
     rows = df.where(df.notna(), other=None).to_dict(orient="records")
     conn.executemany(
         """
@@ -608,10 +619,10 @@ def save_sector_monthly_return(conn: sqlite3.Connection, df: pd.DataFrame) -> No
         """,
         rows,
     )
-    conn.commit()
 
 
 def save_sector_rank_snapshot(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
+    """트랜잭션 관리는 호출자 책임 — 이 함수는 commit/rollback을 수행하지 않는다."""
     rows = df.where(df.notna(), other=None).to_dict(orient="records")
     conn.executemany(
         """
@@ -627,10 +638,10 @@ def save_sector_rank_snapshot(conn: sqlite3.Connection, df: pd.DataFrame) -> Non
         """,
         rows,
     )
-    conn.commit()
 
 
 def save_sector_leadership_score(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
+    """트랜잭션 관리는 호출자 책임 — 이 함수는 commit/rollback을 수행하지 않는다."""
     rows = df.where(df.notna(), other=None).to_dict(orient="records")
     conn.executemany(
         """
@@ -656,10 +667,10 @@ def save_sector_leadership_score(conn: sqlite3.Connection, df: pd.DataFrame) -> 
         """,
         rows,
     )
-    conn.commit()
 
 
 def save_sector_rotation_signal(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
+    """트랜잭션 관리는 호출자 책임 — 이 함수는 commit/rollback을 수행하지 않는다."""
     rows = df.where(df.notna(), other=None).to_dict(orient="records")
     conn.executemany(
         """
@@ -685,7 +696,6 @@ def save_sector_rotation_signal(conn: sqlite3.Connection, df: pd.DataFrame) -> N
         """,
         rows,
     )
-    conn.commit()
 ```
 
 ### 7.2 월간 수익률 계산 (MonthlyReturnCalculator)
@@ -1106,8 +1116,8 @@ class SignalConfig:
     rotation_out_current_worse_than:   int = 18
     rotation_out_consecutive_decline:  int = 2
 
-    # 히스토리 워밍업 억제 — 섹터별 첫 N개월은 NEW_LEADER 신호를 발생시키지 않는다.
-    # min_periods=1로 is_recent_best_rank가 항상 1이 되는 초기 구간을 억제.
+    # 히스토리 워밍업 억제 — 섹터별 첫 N개월(1~N번째)은 NEW_LEADER 신호를 발생시키지 않는다.
+    # N+1번째 월부터 신호 허용. obs_count <= N 조건으로 구현.
     # 0이면 억제 없음(기존 동작). new_leader_lookback_months(3)와 같게 설정 권장.
     new_leader_warmup_months:          int = 3
 
@@ -1150,11 +1160,12 @@ class RotationSignalEngine:
         df["is_recent_best_rank"] = (df["rank_no"] == df["_rolling_best_rank"]).astype(int)
         df = df.drop(columns=["_rolling_best_rank"])
 
-        # 워밍업 억제: 섹터별 누적 관측 수가 new_leader_warmup_months 미만이면 is_recent_best_rank=0
+        # 워밍업 억제: 섹터별 누적 관측 수가 new_leader_warmup_months 이하이면 is_recent_best_rank=0
         # min_periods=1로 인해 첫 달 항상 is_recent_best_rank=1이 되는 과잉 신호를 방지
+        # warmup=3 → 1,2,3번째 월 억제 → 4번째 월(window 충족 시점)부터 허용
         if self.config.new_leader_warmup_months > 0:
             obs_count = df.groupby("sector_code").cumcount() + 1
-            df.loc[obs_count < self.config.new_leader_warmup_months, "is_recent_best_rank"] = 0
+            df.loc[obs_count <= self.config.new_leader_warmup_months, "is_recent_best_rank"] = 0
 
         rows = []
         for _, row in df.iterrows():
@@ -1667,10 +1678,12 @@ from app.config.settings import (
 
 
 def _valid_trade_month(value: str) -> str:
-    """YYYY-MM 형식만 허용. 잘못된 형식은 argparse 오류로 처리."""
+    """YYYY-MM 형식 및 월 범위(01~12) 검증. 잘못된 입력은 argparse 오류로 처리."""
     import re
-    if not re.fullmatch(r"\d{4}-\d{2}", value):
-        raise argparse.ArgumentTypeError(f"trade-month must be YYYY-MM format, got: {value!r}")
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        raise argparse.ArgumentTypeError(
+            f"trade-month must be YYYY-MM with month 01~12, got: {value!r}"
+        )
     return value
 
 
@@ -1811,7 +1824,7 @@ PEAK_WARNING > ROTATION_OUT > EXTENDED > LEADER > NEW_LEADER > WATCH
 | EXTENDED | Top10 + 최근6개월 4회 이상 Top10 | 강한 주도장세. 신규 추격 주의 |
 | PEAK_WARNING | 직전 Top5 → 당월 Top15 이탈 | 델타 피크 가능성. 비중 축소 |
 | ROTATION_OUT | 직전 Top10 → 당월 Top18 이탈 + 2개월 연속 하락 | 주도권 이탈. 신규 섹터 탐색 |
-| WATCH | Top20 + total_score ≥ 30 | 모니터링 대상 |
+| WATCH | Top{top_n} 이내 (기본 21위) + total_score ≥ 30 | 모니터링 대상 |
 
 ---
 
