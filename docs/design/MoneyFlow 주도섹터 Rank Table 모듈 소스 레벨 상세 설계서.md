@@ -1,6 +1,6 @@
 # MoneyFlow 주도섹터 Rank Table 모듈 소스 레벨 상세 설계서
 
-문서 버전: v3.3
+문서 버전: v4.0
 작성일: 2026-06-20
 프로젝트명: MoneyFlow Rank Table (MFRT)
 목적: 월별 업종 수익률 순위 테이블을 기반으로 주도 섹터 탄생 → 확산 → 과열 → 피크아웃 → 주도권 교체를 탐지하고, MoneyFlow / 3중스크린 / 추세추종 스윙 투자 시스템에 연결하기 위한 소스 레벨 상세 설계
@@ -17,6 +17,7 @@
 | v3.1 | 2026-06-20 | Path3(_try_krx_direct) 섹션 제목·docstring·상수 주석을 "미확정 설계 계약" 상태로 명확화, settings.py YAML 로더(load_config/build_leadership_score_config/build_signal_config/get_min_months_required) 설계 추가, CLI에서 YAML → Config 실제 연결(--config 인수, build_*_config 호출, min_months YAML에서 로드) |
 | v3.2 | 2026-06-20 | _fetch_month_end 실패 반환 계약 3튜플로 통일((None,None) → (None,None,"")), SignalConfig에서 미사용 중복 필드(leader_lookback_months/extended_lookback_months) 제거 — 윈도우 소스를 LeadershipScoreConfig 단일 소유로 명확화, YAML signals 섹션 주석 정합성 수정 |
 | v3.3 | 2026-06-20 | LeadershipScoreConfig rolling window 주석에서 구버전 표현("SignalConfig와 반드시 일치") 제거 — 단일 소유 의도와 일치하도록 수정 |
+| v4.0 | 2026-06-20 | 전문가 리뷰 #1~#16 전체 반영: rotation_signal PK 단순화, return_zscore 컬럼 제거, _extract_last_row fallback 제거, rolling_min_periods config화, _calc_consecutive_top10 transform 방식 교체, CLI 단일 트랜잭션, --trade-month 형식 검증, test_rotation_out 다월 재작성, mask_adjacent PeriodIndex 벡터화, NEW_LEADER warmup 억제 옵션, expansion_score NULL 방어, snapshot PK 변경, top_n YAML 연결, LEADERSHIP_SCORE_COLUMNS 컬럼 select, 연도 경계 테스트 추가, _make_reason NaN 가드 |
 
 ---
 
@@ -233,8 +234,6 @@ CREATE TABLE IF NOT EXISTS sector_monthly_return (
     rank_change            INTEGER,   -- prev_rank_no - rank_no. 양수면 순위 상승
     trading_value          REAL,      -- 해당 월 거래대금 (price에서 직접 가져옴)
     prev_trading_value     REAL,      -- 전월 거래대금 (volume_score 계산용)
-    return_zscore          REAL,
-    market_relative_return REAL,
     created_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (trade_month, sector_code)
 );
@@ -250,14 +249,18 @@ ON sector_monthly_return(trade_month, rank_no);
 ```sql
 CREATE TABLE IF NOT EXISTS sector_rank_snapshot (
     trade_month   TEXT NOT NULL,
-    rank_no       INTEGER NOT NULL,
     sector_code   TEXT NOT NULL,
     sector_name   TEXT NOT NULL,
+    rank_no       INTEGER NOT NULL,
     monthly_return REAL NOT NULL,
     theme_group   TEXT,
     display_color TEXT,            -- sector_master에서 복사 (조회 편의)
-    PRIMARY KEY (trade_month, rank_no)
+    -- PK = (trade_month, sector_code): 재실행 시 rank_no 기반 PK는 sector_code 매핑을 오염시킬 수 있다.
+    PRIMARY KEY (trade_month, sector_code)
 );
+
+CREATE INDEX IF NOT EXISTS idx_sector_rank_snapshot_rank
+ON sector_rank_snapshot(trade_month, rank_no);
 ```
 
 ### 5.5 sector_leadership_score
@@ -301,7 +304,9 @@ CREATE TABLE IF NOT EXISTS sector_rotation_signal (
     rank_declining_2m        INTEGER NOT NULL DEFAULT 0,
     reason                   TEXT,
     created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (trade_month, sector_code, signal)
+    -- PK = (trade_month, sector_code): _decide_signal()은 섹터당 단일 신호만 반환한다.
+    -- signal은 PK에서 제외 — 복수 행 저장 구조가 아님.
+    PRIMARY KEY (trade_month, sector_code)
 );
 ```
 
@@ -366,9 +371,12 @@ leadership_score:
   volume_score: 20
   overheat_top10_months: 4
   overheat_penalty: -10
-  # rolling window 크기 — 아래 signals 섹션의 lookback_months와 반드시 일치해야 한다
+  # rolling window 크기 — LeadershipScoreConfig 단일 소유
   leader_lookback_months: 3      # LeadershipScoreEngine top10_in_3m 윈도우
   extended_lookback_months: 6    # LeadershipScoreEngine top10_in_6m 윈도우
+  # rolling_min_periods: 1이면 첫 달부터 카운터 집계 (신호 조기 활성화 가능)
+  # lw(3) 또는 ew(6)으로 설정하면 window 충족 전 top10_in_Xm=0 → 초기 신호 억제
+  rolling_min_periods: 1
 
 signals:
   new_leader:
@@ -376,6 +384,7 @@ signals:
     min_rank_change: 5             # top_n=21 기준 5계단 이상 급등
     require_recent_best_rank: true # 최근 lookback_months 내 현재가 최고 순위여야 함
     lookback_months: 3             # SignalConfig.new_leader_lookback_months 에 반영
+    warmup_months: 3               # 섹터별 첫 N개월 NEW_LEADER 억제 (0이면 비활성)
   leader:
     # rolling 윈도우 크기(top10_in_3m)는 leadership_score.leader_lookback_months 가 결정한다.
     # SignalConfig 에는 윈도우 크기 필드가 없다 — 임계값만 보유.
@@ -472,6 +481,7 @@ def build_leadership_score_config(cfg: dict) -> LeadershipScoreConfig:
         overheat_penalty=ls.get("overheat_penalty", -10),
         leader_lookback_months=ls.get("leader_lookback_months", 3),
         extended_lookback_months=ls.get("extended_lookback_months", 6),
+        rolling_min_periods=ls.get("rolling_min_periods", 1),
     )
 
 
@@ -488,6 +498,7 @@ def build_signal_config(cfg: dict) -> SignalConfig:
         new_leader_min_rank_change=nl.get("min_rank_change", 5),
         new_leader_require_recent_best=nl.get("require_recent_best_rank", True),
         new_leader_lookback_months=nl.get("lookback_months", 3),
+        new_leader_warmup_months=nl.get("warmup_months", 3),
         leader_min_top10_count=ld.get("min_top10_count", 2),
         leader_min_total_score=ld.get("min_total_score", 50.0),
         extended_min_top10_count=ext.get("min_top10_count", 4),
@@ -496,12 +507,18 @@ def build_signal_config(cfg: dict) -> SignalConfig:
         rotation_out_previous_top_rank=ro.get("previous_top_rank", 10),
         rotation_out_current_worse_than=ro.get("current_rank_worse_than", 18),
         rotation_out_consecutive_decline=ro.get("require_consecutive_decline", 2),
+        top_n=cfg.get("sector_universe", {}).get("top_n", 21),
     )
 
 
 def get_min_months_required(cfg: dict) -> int:
     """cfg["sector_universe"]["min_months_required"] 반환."""
     return cfg.get("sector_universe", {}).get("min_months_required", 2)
+
+
+def get_top_n(cfg: dict) -> int:
+    """cfg["sector_universe"]["top_n"] 반환. RankTableBuilder·SignalConfig에 주입한다."""
+    return cfg.get("sector_universe", {}).get("top_n", 21)
 ```
 
 ---
@@ -599,11 +616,11 @@ def save_sector_rank_snapshot(conn: sqlite3.Connection, df: pd.DataFrame) -> Non
     conn.executemany(
         """
         INSERT INTO sector_rank_snapshot
-            (trade_month, rank_no, sector_code, sector_name, monthly_return, theme_group, display_color)
-        VALUES (:trade_month, :rank_no, :sector_code, :sector_name, :monthly_return, :theme_group, :display_color)
-        ON CONFLICT(trade_month, rank_no) DO UPDATE SET
-            sector_code   = excluded.sector_code,
+            (trade_month, sector_code, sector_name, rank_no, monthly_return, theme_group, display_color)
+        VALUES (:trade_month, :sector_code, :sector_name, :rank_no, :monthly_return, :theme_group, :display_color)
+        ON CONFLICT(trade_month, sector_code) DO UPDATE SET
             sector_name   = excluded.sector_name,
+            rank_no       = excluded.rank_no,
             monthly_return = excluded.monthly_return,
             theme_group   = excluded.theme_group,
             display_color = excluded.display_color
@@ -653,7 +670,9 @@ def save_sector_rotation_signal(conn: sqlite3.Connection, df: pd.DataFrame) -> N
         VALUES (:trade_month, :sector_code, :sector_name, :signal, :signal_strength, :total_score,
                 :rank_no, :rank_change, :top10_in_3m, :top10_in_6m, :consecutive_top10,
                 :rank_declining_2m, :reason)
-        ON CONFLICT(trade_month, sector_code, signal) DO UPDATE SET
+        ON CONFLICT(trade_month, sector_code) DO UPDATE SET
+            sector_name       = excluded.sector_name,
+            signal            = excluded.signal,
             signal_strength   = excluded.signal_strength,
             total_score       = excluded.total_score,
             rank_no           = excluded.rank_no,
@@ -736,30 +755,23 @@ class MonthlyReturnCalculator:
 
         df = price_df[price_df["sector_code"].isin(valid_sectors)].copy()
         df = df.sort_values(["sector_code", "trade_month"])
-        df["trade_month_dt"] = pd.to_datetime(df["trade_month"], format="%Y-%m")
+        # pd.Period 기반으로 연산 — 연도 경계(12월→1월)를 포함한 인접 월 검증을 안전하게 처리
+        df["trade_period"] = df["trade_month"].apply(lambda m: pd.Period(m, freq="M"))
 
         # 전월 close 및 거래대금
         df["prev_close"] = df.groupby("sector_code")["close_price"].shift(1)
-        df["prev_month_dt"] = df.groupby("sector_code")["trade_month_dt"].shift(1)
+        df["prev_period"] = df.groupby("sector_code")["trade_period"].shift(1)
         if "trading_value" in df.columns:
             df["prev_trading_value"] = df.groupby("sector_code")["trading_value"].shift(1)
         else:
             df["trading_value"] = np.nan
             df["prev_trading_value"] = np.nan
 
-        # 인접 월 검증: 전월 레코드가 정확히 1개월 전이어야 함
-        def _expected_prev(dt: pd.Timestamp) -> pd.Timestamp:
-            if dt.month == 1:
-                return pd.Timestamp(year=dt.year - 1, month=12, day=1)
-            return pd.Timestamp(year=dt.year, month=dt.month - 1, day=1)
-
-        mask_adjacent = df.apply(
-            lambda row: (
-                pd.notna(row["prev_month_dt"])
-                and row["prev_month_dt"].year == _expected_prev(row["trade_month_dt"]).year
-                and row["prev_month_dt"].month == _expected_prev(row["trade_month_dt"]).month
-            ),
-            axis=1,
+        # 인접 월 검증 (벡터화): 직전 관측치가 정확히 1 Period 전인 경우만 수익률 계산
+        # apply(axis=1) + Timestamp 생성 방식 대신 Period 산술 연산으로 교체
+        # → 연도 경계(12월→1월) 자동 처리, 성능 대폭 향상
+        mask_adjacent = df["prev_period"].notna() & (
+            df["prev_period"] == df["trade_period"] - 1
         )
 
         df["monthly_return"] = np.where(
@@ -879,6 +891,9 @@ class LeadershipScoreConfig:
     # rolling window 크기 — 단일 소유. RotationSignalEngine은 이미 계산된 컬럼값을 읽을 뿐
     leader_lookback_months:     int   = 3    # top10_in_3m 윈도우 크기
     extended_lookback_months:   int   = 6    # top10_in_6m 윈도우 크기
+    # rolling min_periods: 1이면 첫 달부터 카운터 집계, lw/ew로 설정하면 window 충족 전 NaN(→0)
+    # 기본값 1 = 초기 달부터 신호 활성화. YAML에서 조정 가능.
+    rolling_min_periods:        int   = 1
 
 
 class LeadershipScoreEngine:
@@ -909,16 +924,17 @@ class LeadershipScoreEngine:
         # 윈도우 카운터 (config 값 사용 — 하드코딩 금지)
         lw = self.config.leader_lookback_months    # 기본 3
         ew = self.config.extended_lookback_months  # 기본 6
+        mp = self.config.rolling_min_periods       # 기본 1 (첫 달부터 카운트), lw/ew로 설정 시 window 충족 전 0
         df["_is_top10"] = (df["rank_no"] <= 10).astype(int)
         df["top10_in_3m"] = (
             df.groupby("sector_code")["_is_top10"]
-            .transform(lambda s: s.rolling(lw, min_periods=1).sum())
-            .astype(int)
+            .transform(lambda s: s.rolling(lw, min_periods=mp).sum())
+            .fillna(0).astype(int)
         )
         df["top10_in_6m"] = (
             df.groupby("sector_code")["_is_top10"]
-            .transform(lambda s: s.rolling(ew, min_periods=1).sum())
-            .astype(int)
+            .transform(lambda s: s.rolling(ew, min_periods=mp).sum())
+            .fillna(0).astype(int)
         )
         df["consecutive_top10"] = self._calc_consecutive_top10(df)
         df = df.drop(columns=["_is_top10"])
@@ -968,13 +984,23 @@ class LeadershipScoreEngine:
         return 0
 
     def _calc_consecutive_top10(self, df: pd.DataFrame) -> pd.Series:
-        result = []
-        for _, group in df.groupby("sector_code", sort=False):
-            count = 0
-            for _, row in group.iterrows():
-                count = count + 1 if row["rank_no"] <= 10 else 0
-                result.append(count)
-        return pd.Series(result, index=df.index)
+        """
+        섹터별 Top10 연속 진입 횟수를 계산한다.
+        groupby(sort=False) + iterrows() + 수동 append 방식은 df 정렬 상태에 따라
+        index 배정이 어긋날 수 있으므로, groupby-transform + cumsum 방식으로 대체한다.
+        """
+        is_top10 = (df["rank_no"] <= 10).astype(int)
+        # 연속 구간을 식별하기 위한 그룹 번호: Top10이 끊길 때마다 번호 증가
+        break_flag = df.groupby("sector_code")["rank_no"].transform(
+            lambda s: (s > 10).astype(int).cumsum()
+        )
+        # (sector_code, break_group) 내에서 is_top10의 누적 합 = 연속 횟수
+        consecutive = (
+            is_top10
+            .groupby([df["sector_code"], break_flag])
+            .transform("cumsum")
+        )
+        return consecutive.astype(int)
 
     def _calc_expansion_score(
         self,
@@ -984,7 +1010,11 @@ class LeadershipScoreEngine:
         scores = pd.Series(0, index=df.index)
         for trade_month, month_df in df.groupby("trade_month"):
             top20 = month_df[month_df["rank_no"] <= 20]
-            theme_counts = top20.groupby("theme_group")["sector_code"].nunique()
+            # theme_group이 NULL인 섹터는 pandas groupby 기본(dropna=True)으로 제외된다.
+            # sector_master의 theme_group은 NOT NULL이므로 정상 운용 시 NULL 없음.
+            # NULL 행이 있어도 안전하게 건너뛰는 것이 의도된 동작이다.
+            top20_valid = top20.dropna(subset=["theme_group"])
+            theme_counts = top20_valid.groupby("theme_group")["sector_code"].nunique()
             strong_themes = set(
                 theme_counts[theme_counts >= self.config.expansion_min_related_count].index
             )
@@ -1015,7 +1045,8 @@ class LeadershipScoreEngine:
         reasons = []
         if row["rank_score"] > 0:
             reasons.append(f"상위 순위 {row['rank_no']}위")
-        if row["momentum_score"] > 0:
+        if row["momentum_score"] > 0 and pd.notna(row["rank_change"]):
+            # rank_change가 notna인 경우만 int 변환 (momentum_score > 0이면 notna가 보장되나 명시적 방어)
             reasons.append(f"순위 급상승 {int(row['rank_change'])}계단")
         if row["persistence_score"] > 0:
             reasons.append(f"Top10 최근3개월 {int(row['top10_in_3m'])}회")
@@ -1075,6 +1106,15 @@ class SignalConfig:
     rotation_out_current_worse_than:   int = 18
     rotation_out_consecutive_decline:  int = 2
 
+    # 히스토리 워밍업 억제 — 섹터별 첫 N개월은 NEW_LEADER 신호를 발생시키지 않는다.
+    # min_periods=1로 is_recent_best_rank가 항상 1이 되는 초기 구간을 억제.
+    # 0이면 억제 없음(기존 동작). new_leader_lookback_months(3)와 같게 설정 권장.
+    new_leader_warmup_months:          int = 3
+
+    # 전체 업종 수 — WATCH 기준 등 top_n 기반 경계값 계산에 사용
+    # YAML sector_universe.top_n 에서 주입. 하드코딩 금지.
+    top_n:                             int = 21
+
 
 class RotationSignalEngine:
     def __init__(self, config: SignalConfig | None = None):
@@ -1109,6 +1149,12 @@ class RotationSignalEngine:
         )
         df["is_recent_best_rank"] = (df["rank_no"] == df["_rolling_best_rank"]).astype(int)
         df = df.drop(columns=["_rolling_best_rank"])
+
+        # 워밍업 억제: 섹터별 누적 관측 수가 new_leader_warmup_months 미만이면 is_recent_best_rank=0
+        # min_periods=1로 인해 첫 달 항상 is_recent_best_rank=1이 되는 과잉 신호를 방지
+        if self.config.new_leader_warmup_months > 0:
+            obs_count = df.groupby("sector_code").cumcount() + 1
+            df.loc[obs_count < self.config.new_leader_warmup_months, "is_recent_best_rank"] = 0
 
         rows = []
         for _, row in df.iterrows():
@@ -1166,7 +1212,7 @@ class RotationSignalEngine:
             if not cfg.new_leader_require_recent_best or recent_best:
                 return "NEW_LEADER"
 
-        if rank_no <= 20 and total_score >= 30:
+        if rank_no <= cfg.top_n and total_score >= 30:
             return "WATCH"
 
         return None
@@ -1450,9 +1496,12 @@ class SectorPriceCollector:
         self, df: pd.DataFrame
     ) -> tuple[float | None, float | None]:
         last = df.iloc[-1]
+        # "종가" 컬럼이 없으면 None 반환 — iloc[-1] fallback은 잘못된 컬럼(시가총액 등)을 반환할 수 있어 금지
+        if "종가" not in last.index:
+            return None, None
         try:
-            close = float(last.get("종가", last.iloc[-1]))
-        except Exception:
+            close = float(last["종가"])
+        except (ValueError, TypeError):
             return None, None
         tvol = float(last["거래대금"]) if "거래대금" in last.index else None
         return close, tvol
@@ -1613,12 +1662,21 @@ from app.config.settings import (
     build_leadership_score_config,
     build_signal_config,
     get_min_months_required,
+    get_top_n,
 )
+
+
+def _valid_trade_month(value: str) -> str:
+    """YYYY-MM 형식만 허용. 잘못된 형식은 argparse 오류로 처리."""
+    import re
+    if not re.fullmatch(r"\d{4}-\d{2}", value):
+        raise argparse.ArgumentTypeError(f"trade-month must be YYYY-MM format, got: {value!r}")
+    return value
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MFRT 월간 파이프라인")
-    parser.add_argument("--trade-month", required=True, help="YYYY-MM")
+    parser.add_argument("--trade-month", required=True, type=_valid_trade_month, help="YYYY-MM")
     parser.add_argument("--with-leader-stocks", action="store_true")
     parser.add_argument("--export-report", action="store_true")
     parser.add_argument("--db-path", default=None)
@@ -1632,48 +1690,69 @@ def main() -> None:
     # YAML 설정 로드 — 모든 엔진 파라미터의 단일 진입점
     cfg = load_config(args.config)
     min_months = get_min_months_required(cfg)
+    top_n      = get_top_n(cfg)
 
     conn = get_connection(args.db_path)
 
-    # 1. 수집
+    # 1. 수집 — 트랜잭션 외부에서 수행 (네트워크 I/O는 트랜잭션 안에 두지 않는다)
     collector = SectorPriceCollector()
     price_df = collector.collect_monthly_prices(args.trade_month)
-    upsert_sector_monthly_price(conn, price_df)
 
-    # 2. 전체 로드 → 수익률 계산 (min_months_required는 YAML sector_universe 에서)
-    all_price_df = load_all_monthly_prices(conn)
-    returns_df = MonthlyReturnCalculator().calculate(all_price_df, min_months_required=min_months)
-    save_sector_monthly_return(conn, returns_df)
+    # 2~5. DB 저장 단계 전체를 단일 트랜잭션으로 묶는다.
+    # 중간 실패 시 rollback하여 price·return·snapshot·score·signal이 부분 저장되는 상태를 방지.
+    try:
+        conn.execute("BEGIN")
 
-    # 3. Snapshot (display_color 포함)
-    sector_master_df = load_sector_master(conn)
-    builder = RankTableBuilder()
-    snapshot_df = builder.build_snapshot(returns_df, sector_master_df)
-    save_sector_rank_snapshot(conn, snapshot_df)
+        upsert_sector_monthly_price(conn, price_df)
 
-    # 4. 점수 계산 — rolling window 등 파라미터는 YAML leadership_score 에서
-    score_engine = LeadershipScoreEngine(build_leadership_score_config(cfg))
-    scored_df = score_engine.score(returns_df, sector_master_df)
-    save_sector_leadership_score(conn, scored_df)
+        # 전체 로드 → 수익률 계산 (min_months_required는 YAML sector_universe 에서)
+        all_price_df = load_all_monthly_prices(conn)
+        returns_df = MonthlyReturnCalculator().calculate(all_price_df, min_months_required=min_months)
+        save_sector_monthly_return(conn, returns_df)
 
-    # 5. 신호 생성 — consecutive_decline 등 파라미터는 YAML signals 에서
-    signal_df = RotationSignalEngine(build_signal_config(cfg)).generate(scored_df)
-    save_sector_rotation_signal(conn, signal_df)
+        # Snapshot (display_color 포함)
+        sector_master_df = load_sector_master(conn)
+        builder = RankTableBuilder()
+        snapshot_df = builder.build_snapshot(returns_df, sector_master_df)
+        save_sector_rank_snapshot(conn, snapshot_df)
+
+        # 점수 계산 — rolling window 등 파라미터는 YAML leadership_score 에서
+        score_engine = LeadershipScoreEngine(build_leadership_score_config(cfg))
+        LEADERSHIP_SCORE_COLUMNS = [
+            "trade_month", "sector_code", "sector_name", "rank_no", "rank_change",
+            "total_score", "rank_score", "momentum_score", "persistence_score",
+            "expansion_score", "volume_score", "risk_penalty",
+            "top10_in_3m", "top10_in_6m", "consecutive_top10", "score_reason",
+        ]
+        scored_df = score_engine.score(returns_df, sector_master_df)
+        save_sector_leadership_score(conn, scored_df[LEADERSHIP_SCORE_COLUMNS])
+
+        # 신호 생성 — consecutive_decline 등 파라미터는 YAML signals 에서
+        signal_df = RotationSignalEngine(build_signal_config(cfg)).generate(scored_df)
+        save_sector_rotation_signal(conn, signal_df)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
     # 6. 대장주 후보 (--with-leader-stocks 플래그)
     if args.with_leader_stocks:
         # stock_df는 별도 수집기로 준비 (Phase 2)
         pass
 
-    # 7. 리포트
+    # 7. 리포트 (트랜잭션 외부 — 출력 경로 자동 생성)
     if args.export_report:
-        rank_table  = builder.build_rank_table(returns_df)
+        from pathlib import Path
+        out_dir = Path(__file__).parent.parent.parent / "reports" / "sector_rank"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"sector_rank_{args.trade_month}.xlsx"
+        rank_table   = builder.build_rank_table(returns_df, top_n=top_n)
         color_lookup = builder.build_color_lookup(snapshot_df)
-        out_path = f"reports/sector_rank/sector_rank_{args.trade_month}.xlsx"
         RankTableExcelExporter().export(
             rank_table=rank_table,
             snapshot_df=snapshot_df,
-            output_path=out_path,
+            output_path=str(out_path),
             color_lookup=color_lookup,
         )
         print(f"[ok] report saved: {out_path}")
@@ -1818,6 +1897,34 @@ def test_min_months_first_return_included():
     assert set(result["trade_month"]) == {"2026-02"}
 
 
+def test_year_boundary_adjacent_month():
+    """12월 → 1월 연도 경계를 인접 월로 인식하고 수익률을 계산해야 한다."""
+    df = _make_price([
+        {"trade_month": "2025-12", "sector_code": "1011", "sector_name": "전기전자",
+         "close_price": 100, "trading_value": 1_000_000},
+        {"trade_month": "2026-01", "sector_code": "1011", "sector_name": "전기전자",
+         "close_price": 110, "trading_value": 1_200_000},
+    ])
+    result = MonthlyReturnCalculator().calculate(df)
+    assert len(result) == 1
+    assert result.iloc[0]["trade_month"] == "2026-01"
+    assert abs(result.iloc[0]["monthly_return"] - 10.0) < 1e-6
+
+
+def test_year_boundary_gap_excluded():
+    """12월이 빠지고 11월 → 1월인 경우 1월 수익률은 제외돼야 한다."""
+    df = _make_price([
+        {"trade_month": "2025-11", "sector_code": "1011", "sector_name": "전기전자",
+         "close_price": 100, "trading_value": 1_000_000},
+        # 12월 누락
+        {"trade_month": "2026-01", "sector_code": "1011", "sector_name": "전기전자",
+         "close_price": 115, "trading_value": 1_200_000},
+    ])
+    result = MonthlyReturnCalculator().calculate(df)
+    # 11월 → 1월은 2개월 갭이므로 수익률 제외, 결과가 비어야 함
+    assert result.empty
+
+
 def test_trading_value_passthrough():
     """trading_value와 prev_trading_value가 반환 DataFrame에 포함돼야 한다."""
     df = _make_price([
@@ -1924,14 +2031,33 @@ def test_peak_warning():
 
 
 def test_rotation_out_requires_2m_decline():
-    """2개월 연속 하락 없으면 ROTATION_OUT 미발생."""
-    df_no_decline = _base_row(rank_no=19, prev_rank_no=8, rank_declining_2m=0)
-    result = RotationSignalEngine().generate(df_no_decline)
-    assert result.empty or result.iloc[0]["signal"] != "ROTATION_OUT"
+    """2개월 연속 하락 없으면 ROTATION_OUT 미발생.
 
-    df_with_decline = _base_row(rank_no=19, prev_rank_no=8, rank_declining_2m=1)
-    result2 = RotationSignalEngine().generate(df_with_decline)
-    assert result2.iloc[0]["signal"] == "ROTATION_OUT"
+    주의: generate()는 입력 DataFrame에서 rank_declining_2m을 내부 재계산한다.
+    단일 행으로는 diff()가 NaN이 되어 rolling(2, min_periods=2)가 항상 0이 된다.
+    최소 3개월 데이터로 실제 연속 하락 구간을 만들어야 한다.
+    """
+    # sector_code 1011, 3개월 데이터: 6위→8위(하락)→19위(하락) — 연속 2개월 하락
+    rows_decline = [
+        {**_base_row(rank_no=6,  trade_month="2026-04", prev_rank_no=None).iloc[0].to_dict()},
+        {**_base_row(rank_no=8,  trade_month="2026-05", prev_rank_no=6).iloc[0].to_dict()},
+        {**_base_row(rank_no=19, trade_month="2026-06", prev_rank_no=8).iloc[0].to_dict()},
+    ]
+    df_with_decline = pd.DataFrame(rows_decline)
+    result = RotationSignalEngine().generate(df_with_decline)
+    jun_row = result[result["trade_month"] == "2026-06"]
+    assert not jun_row.empty and jun_row.iloc[0]["signal"] == "ROTATION_OUT"
+
+    # sector_code 1011, 3개월 데이터: 8위→6위(상승)→19위(하락) — 연속 2개월 미달
+    rows_no_decline = [
+        {**_base_row(rank_no=8,  trade_month="2026-04", prev_rank_no=None).iloc[0].to_dict()},
+        {**_base_row(rank_no=6,  trade_month="2026-05", prev_rank_no=8).iloc[0].to_dict()},
+        {**_base_row(rank_no=19, trade_month="2026-06", prev_rank_no=6).iloc[0].to_dict()},
+    ]
+    df_no_decline = pd.DataFrame(rows_no_decline)
+    result2 = RotationSignalEngine().generate(df_no_decline)
+    jun_row2 = result2[result2["trade_month"] == "2026-06"]
+    assert jun_row2.empty or jun_row2.iloc[0]["signal"] != "ROTATION_OUT"
 ```
 
 ### 12.4 volume_score 파이프라인 통합 테스트
